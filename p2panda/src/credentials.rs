@@ -46,6 +46,15 @@ impl Credentials {
         Self(Arc::new(inner))
     }
 
+    /// Builds credentials from keys the application already holds, for example an identity
+    /// restored from a backup.
+    pub fn from_keys(signing_key: SigningKey, identity_secret_key: SecretKey) -> Self {
+        Self(Arc::new(Inner {
+            signing_key,
+            identity_secret_key,
+        }))
+    }
+
     pub fn verifying_key(&self) -> VerifyingKey {
         self.0.signing_key.verifying_key()
     }

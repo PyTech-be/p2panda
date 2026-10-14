@@ -92,6 +92,14 @@ impl From<Member> for ActorId {
     }
 }
 
+impl From<p2panda_spaces::member::Member> for Member {
+    /// Wraps a key bundle received outside of p2panda, for example inside an application message.
+    /// Call [`Member::verify`] before trusting it.
+    fn from(inner: p2panda_spaces::member::Member) -> Self {
+        Self { inner }
+    }
+}
+
 impl From<Member> for p2panda_spaces::member::Member {
     fn from(value: Member) -> p2panda_spaces::member::Member {
         value.inner

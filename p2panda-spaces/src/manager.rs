@@ -267,7 +267,10 @@ where
                 output.space_y = space_y;
                 output.events = events;
             }
-            SpacesArgs::SpaceUpdate { .. } => unimplemented!(),
+            // Not supported yet. A peer can still send one, so reject it instead of panicking.
+            SpacesArgs::SpaceUpdate { .. } => {
+                return Err(ManagerError::UnsupportedMessage(message.hash()));
+            }
             // Received encrypted application data for a space.
             SpacesArgs::Application { space_id, .. } => {
                 let Some(space) = self.space(*space_id).await? else {
@@ -795,6 +798,9 @@ where
         "received space message with id {0} before auth message {1}, maybe it arrived out-of-order"
     )]
     MissingAuthMessage(Hash, Hash),
+
+    #[error("received unsupported space update message with id {0}")]
+    UnsupportedMessage(Hash),
 
     #[error("space not found {0}")]
     SpaceNotFound(SpaceId),

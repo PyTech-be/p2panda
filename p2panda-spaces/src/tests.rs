@@ -17,11 +17,12 @@ use p2panda_encryption::key_bundle::{Lifetime, LongTermKeyBundle, PreKey};
 
 use crate::SpaceId;
 use crate::event::{Event, GroupActor, GroupContext, GroupEvent, SpaceContext, SpaceEvent};
+use crate::forge::Forge;
 use crate::manager::ManagerError;
 use crate::member::Member;
 use crate::message::SpacesArgs;
 use crate::space::{Space, SpaceError, SpaceOutput};
-use crate::test_utils::{TestPeer, TestSpaceError};
+use crate::test_utils::{TestForge, TestPeer, TestSpaceError};
 use crate::types::AuthGroupAction;
 
 fn split_messages<C, M>(messages: Vec<(M, Vec<Event<C>>)>) -> (Vec<M>, Vec<Event<C>>) {
@@ -2413,4 +2414,38 @@ async fn add_group_from_shared_groups_state_regression() {
     let y = space.state().await.unwrap();
     expected_operations += 1;
     assert_eq!(y.groups_y.inner.operations.len(), expected_operations);
+}
+
+#[tokio::test]
+async fn reject_space_update_from_peer() {
+    let alice = TestPeer::new(0).await;
+    let bob = TestPeer::new(1).await;
+
+    alice
+        .manager
+        .register_member(&bob.manager.me().await.unwrap())
+        .await
+        .unwrap();
+
+    let space_id = SpaceId::digest(b"0");
+    alice
+        .manager
+        .create_space_persisted(space_id, &[(bob.manager.id(), Access::write())])
+        .await
+        .unwrap();
+
+    // Space updates are not supported yet. A peer sending one anyway must get an error back, not
+    // crash the receiving node.
+    let forge = TestForge::new(bob.store.clone(), bob.credentials.signing_key());
+    let message = forge
+        .forge(SpacesArgs::SpaceUpdate {
+            space_id,
+            group_id: alice.manager.id(),
+            space_dependencies: vec![],
+        })
+        .await
+        .unwrap();
+
+    let result = alice.manager.process(&message).await;
+    assert!(matches!(result, Err(ManagerError::UnsupportedMessage(_))));
 }
