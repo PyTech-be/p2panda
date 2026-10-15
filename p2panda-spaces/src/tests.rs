@@ -2449,3 +2449,42 @@ async fn reject_space_update_from_peer() {
     let result = alice.manager.process(&message).await;
     assert!(matches!(result, Err(ManagerError::UnsupportedMessage(_))));
 }
+
+/// Concorde patch: a membership change that can't be encrypted (no key bundle for the new member)
+/// must fail before anything is signed. Before, the auth message was forged and persisted first,
+/// then the encryption step failed: the message stayed in our log, peers synced and built on it,
+/// and our own orderer waited forever for it.
+#[tokio::test]
+async fn add_without_key_bundle_signs_nothing() {
+    let alice = TestPeer::new(0).await;
+    let bob = <TestPeer>::new(1).await;
+    let manager = alice.manager.clone();
+
+    let space_id = SpaceId::digest(b"0");
+    let (space, output) = manager.create_space_persisted(space_id, &[]).await.unwrap();
+    let (messages, _) = split_messages(output.messages);
+    let last_seq = messages.last().unwrap().header.seq_num;
+    drop(space);
+
+    // Bob's key bundle is unknown: refused, and nothing forged.
+    let space = manager.space(space_id).await.unwrap().unwrap();
+    let result = space.add_persisted(bob.manager.id(), Access::read()).await;
+    assert!(matches!(result, Err(SpaceError::MissingKeyBundle(id)) if id == bob.manager.id()));
+    assert_eq!(space.members().await.unwrap().len(), 1);
+    drop(space);
+
+    // Once the bundle is known, the add takes the very next sequence number.
+    alice
+        .manager
+        .register_member(&bob.manager.me().await.unwrap())
+        .await
+        .unwrap();
+    let space = manager.space(space_id).await.unwrap().unwrap();
+    let (auth_message, _, _) = split_space_output(
+        space
+            .add_persisted(bob.manager.id(), Access::read())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(auth_message.header.seq_num, last_seq + 1);
+}

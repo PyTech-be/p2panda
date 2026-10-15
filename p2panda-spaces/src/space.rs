@@ -10,9 +10,11 @@ use p2panda_auth::traits::{Conditions, Operation};
 use p2panda_auth::validation::{VerifyClaimedWriteError, verify_claimed_write_access};
 use p2panda_core::traits::{Digest, ShortFormat};
 use p2panda_core::{SigningKey, VerifyingKey};
+use p2panda_encryption::key_bundle::LongTermKeyBundle;
 use p2panda_encryption::key_manager::KeyManagerState;
-use p2panda_encryption::key_registry::KeyRegistryState;
+use p2panda_encryption::key_registry::{KeyRegistry, KeyRegistryState};
 use p2panda_encryption::traits::GroupMessage;
+use p2panda_encryption::traits::PreKeyRegistry;
 use p2panda_encryption::{Rng, RngError};
 use p2panda_store::Transaction;
 use p2panda_store::groups::GroupsStore;
@@ -173,6 +175,8 @@ where
         let member = member.into();
 
         let space_y = self.state().await?;
+        let added = (!access.is_pull()).then_some(member);
+        self.ensure_key_bundles(&space_y, added, None).await?;
         let group = Group::new(self.manager.clone(), space_y.group_id);
 
         let group_output = group.add(member, access).await?;
@@ -201,6 +205,8 @@ where
         let member = member.into();
 
         let space_y = self.state().await?;
+        self.ensure_key_bundles(&space_y, None, Some(member))
+            .await?;
         let group = Group::new(self.manager.clone(), space_y.group_id);
 
         let group_output = group.remove(member).await?;
@@ -230,6 +236,8 @@ where
         let member = member.into();
 
         let space_y = self.state().await?;
+        let added = (!access.is_pull()).then_some(member);
+        self.ensure_key_bundles(&space_y, added, None).await?;
         let group = Group::new(self.manager.clone(), space_y.group_id);
 
         let group_output = group.promote(member, access).await?;
@@ -259,6 +267,8 @@ where
         let member = member.into();
 
         let space_y = self.state().await?;
+        let removed = access.is_pull().then_some(member);
+        self.ensure_key_bundles(&space_y, None, removed).await?;
         let group = Group::new(self.manager.clone(), space_y.group_id);
 
         let group_output = group.demote(member, access).await?;
@@ -275,6 +285,62 @@ where
             space_y,
             vec![(space_message, space_events)],
         ))
+    }
+
+    /// Check, before anything is signed, that a valid key bundle is known for everyone who will
+    /// hold the group secret after a membership change: the current secret members, plus `added`
+    /// (and its members, if it is a group), minus `removed`.
+    ///
+    /// The encryption step after the auth message needs these bundles. Failing there would leave
+    /// an auth message already signed and persisted in our log but never applied locally: peers
+    /// sync it and build on it, and our own orderer waits forever for it. This is stricter than
+    /// the encryption scheme needs (members we already share a 2SM session with don't need a
+    /// bundle), so the worst case is a retry once the bundle has arrived.
+    async fn ensure_key_bundles(
+        &self,
+        space_y: &SpacesState<C>,
+        added: Option<ActorId>,
+        removed: Option<ActorId>,
+    ) -> Result<(), SpaceError<F, C>> {
+        // A group's secret members, or the actor itself when it is an individual.
+        let individuals = |actor: ActorId| -> Vec<ActorId> {
+            let members = space_y.groups_y.members(actor);
+            if members.is_empty() {
+                vec![actor]
+            } else {
+                secret_members(&members)
+            }
+        };
+        let mut next: HashSet<ActorId> =
+            secret_members(&space_y.groups_y.members(space_y.group_id))
+                .into_iter()
+                .collect();
+        if let Some(actor) = added {
+            next.extend(individuals(actor));
+        }
+        if let Some(actor) = removed {
+            for id in individuals(actor) {
+                next.remove(&id);
+            }
+        }
+        next.remove(&self.manager.id());
+
+        let mut registry = {
+            let manager = self.manager.inner.read().await;
+            manager.identity.key_registry().await?
+        };
+        for id in next {
+            let (y, bundle) = <KeyRegistry<MemberId> as PreKeyRegistry<
+                MemberId,
+                LongTermKeyBundle,
+            >>::key_bundle(registry, &id)
+            .map_err(|_| SpaceError::MissingKeyBundle(id))?;
+            registry = y;
+            if bundle.is_none() {
+                return Err(SpaceError::MissingKeyBundle(id));
+            }
+        }
+        Ok(())
     }
 
     /// Forge a "pointer" space message from an already existing auth message and apply any
@@ -1127,6 +1193,9 @@ where
 
     #[error("tried to publish when not a member of space {0}")]
     NotWelcomed(SpaceId),
+
+    #[error("no valid key bundle known for member {0}")]
+    MissingKeyBundle(ActorId),
 
     #[error(transparent)]
     UnauthorizedWrite(#[from] VerifyClaimedWriteError),
