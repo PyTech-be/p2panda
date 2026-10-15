@@ -96,3 +96,63 @@ async fn gossip_and_sync_with_same_topic() {
         Some(Body::from_bytes(b"Hello, again, Panda!"))
     );
 }
+
+/// Concorde patch: an operation a live session never pushed (here written straight into the
+/// store, in a log created after the sessions started) still reaches the peer, through the
+/// periodic catch-up sync. Before, it only arrived when the peers reconnected.
+#[tokio::test]
+async fn catch_up_sync_fetches_what_live_mode_never_sent() {
+    setup_logging();
+
+    let topic: Topic = [2; 32].into();
+
+    let mut panda = TestNode::spawn([96; 32], None).await;
+    let panda_sync_handle = panda.log_sync.stream(topic, true).await.unwrap();
+    let mut panda_sync_rx = panda_sync_handle.subscribe().await.unwrap();
+
+    let mut penguin = TestNode::spawn([97; 32], None).await;
+    penguin
+        .address_book
+        .insert_node_info(panda.node_info().bootstrap())
+        .await
+        .unwrap();
+    let _penguin_sync_handle = penguin.log_sync.stream(topic, true).await.unwrap();
+
+    // Wait until a live session runs between them, with nothing to sync yet.
+    loop {
+        let item = panda_sync_rx.next().await.unwrap().unwrap();
+        if let TopicLogSyncEvent::LiveModeStarted = item.event {
+            break;
+        }
+    }
+
+    // Penguin writes an operation without publishing it: live mode never sends it.
+    let log_id = 0;
+    penguin
+        .client
+        .create_operation(b"Missed by live mode", log_id)
+        .await;
+    penguin
+        .client
+        .associate(
+            &topic,
+            &HashMap::from([(penguin.client_id(), vec![log_id])]),
+        )
+        .await;
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(Ok(item)) = panda_sync_rx.next().await {
+            if let TopicLogSyncEvent::OperationReceived { operation, .. } = item.event {
+                return Some(operation);
+            }
+        }
+        None
+    })
+    .await
+    .expect("the catch-up sync should fetch the operation within a minute")
+    .unwrap();
+    assert_eq!(
+        received.body,
+        Some(Body::from_bytes(b"Missed by live mode"))
+    );
+}
