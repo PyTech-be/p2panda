@@ -189,7 +189,13 @@ where
         let mut metrics: Metrics = sync_metrics.into();
 
         let result = match self.live_mode_rx {
-            None => Ok(()),
+            // Say we're done: a remote in live mode then ends the session cleanly instead of
+            // reporting an unexpected closure (and retrying). A remote not in live mode no longer
+            // reads, so it never sees this.
+            None => sink
+                .send(TopicLogSyncMessage::Close)
+                .await
+                .map_err(|err| TopicLogSyncChannelError::MessageSink(format!("{err:?}")).into()),
             Some(mut live_mode_rx) => {
                 // Enter live-mode.
                 //
@@ -665,16 +671,18 @@ pub mod tests {
             TopicLogSyncEvent::SessionFinished { .. }
         );
 
+        // Not in live mode: the session ends with a close message.
         let messages = remote_rx.collect::<Vec<_>>().await;
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         for (index, message) in messages.into_iter().enumerate() {
             match index {
                 0 => assert_eq!(
                     message,
                     TestTopicSyncMessage::Sync(LogSyncMessage::Have(BTreeMap::default()))
                 ),
-                1 => {
-                    assert_eq!(message, TestTopicSyncMessage::Sync(LogSyncMessage::Done));
+                1 => assert_eq!(message, TestTopicSyncMessage::Sync(LogSyncMessage::Done)),
+                2 => {
+                    assert_eq!(message, TestTopicSyncMessage::Close);
                     break;
                 }
                 _ => panic!(),
@@ -723,8 +731,9 @@ pub mod tests {
             TopicLogSyncEvent::SessionFinished { .. }
         );
 
+        // Not in live mode: the session ends with a close message.
         let messages = remote_rx.collect::<Vec<_>>().await;
-        assert_eq!(messages.len(), 6);
+        assert_eq!(messages.len(), 7);
         for (index, message) in messages.into_iter().enumerate() {
             match index {
                 0 => assert_eq!(
@@ -783,8 +792,9 @@ pub mod tests {
                     assert_eq!(header, header_bytes_2);
                     assert_eq!(Body::from_bytes(&body_inner), body)
                 }
-                5 => {
-                    assert_eq!(message, TestTopicSyncMessage::Sync(LogSyncMessage::Done));
+                5 => assert_eq!(message, TestTopicSyncMessage::Sync(LogSyncMessage::Done)),
+                6 => {
+                    assert_eq!(message, TestTopicSyncMessage::Close);
                     break;
                 }
                 _ => panic!(),
