@@ -34,6 +34,15 @@ use crate::{NodeId, ProtocolId};
 
 const RETRY_RATE: Duration = Duration::from_secs(5);
 
+/// How often a live topic runs a short, non-live sync session with each active peer.
+///
+/// Live mode pushes new operations to peers as they appear, but nothing re-sends one that a peer
+/// missed or rejected (for example an operation which arrived before the one preceding it in its
+/// log, as ingest has no out-of-order buffer), and logs created after a session started are not
+/// part of its topic selection. A periodic catch-up session compares log heights again and fetches
+/// whatever is missing, in order.
+const RESYNC_INTERVAL: Duration = Duration::from_secs(20);
+
 type SessionSink<M> = Pin<
     Box<
         dyn Sink<
@@ -63,6 +72,9 @@ pub enum ToTopicManager<T> {
     /// Retry sync with this peer after a failed session.
     Retry { node_id: NodeId, live_mode: bool },
 
+    /// Run a non-live catch-up session with every active peer, if this topic runs in live mode.
+    Resync,
+
     /// Send newly published data to all sync sessions running over the given topic.
     Publish(T),
 
@@ -87,6 +99,8 @@ where
     session_topic_map: SessionTopicMap<Topic, SessionSink<M>>,
     node_session_map: HashMap<NodeId, HashSet<SyncSessionId>>,
     active_sync_set: HashSet<NodeId>,
+    /// At least one live-mode session was started or accepted on this topic.
+    live: bool,
     actor_session_id_map: HashMap<ActorId, SyncSessionId>,
     next_session_id: SyncSessionId,
     sync_poller_actor: ActorRef<ToSyncPoller>,
@@ -136,9 +150,16 @@ where
 
         // The sync poller actor lives as long as the manager and only terminates due to the
         // manager actor itself terminating.
-        let (sync_poller_actor, _) =
-            SyncPoller::spawn_linked(None, (event_stream, sender), myself.into(), pool.clone())
-                .await?;
+        let (sync_poller_actor, _) = SyncPoller::spawn_linked(
+            None,
+            (event_stream, sender),
+            myself.clone().into(),
+            pool.clone(),
+        )
+        .await?;
+
+        // Stops by itself once this actor has terminated.
+        myself.send_interval(RESYNC_INTERVAL, || ToTopicManager::Resync);
 
         Ok(TopicManagerState {
             topic,
@@ -147,6 +168,7 @@ where
             session_topic_map: SessionTopicMap::default(),
             node_session_map: HashMap::new(),
             active_sync_set: HashSet::new(),
+            live: false,
             next_session_id: 0,
             actor_session_id_map: HashMap::new(),
             sync_poller_actor,
@@ -190,6 +212,7 @@ where
                 );
 
                 state.active_sync_set.insert(node_id);
+                state.live |= live_mode;
                 let config = SessionConfig {
                     topic,
                     remote: node_id,
@@ -274,6 +297,41 @@ where
                     protocol_id: state.protocol_id.clone(),
                 })?;
             }
+            ToTopicManager::Resync => {
+                if !state.live {
+                    return Ok(());
+                }
+                let nodes: Vec<NodeId> = state.active_sync_set.iter().copied().collect();
+                for node_id in nodes {
+                    debug!(
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = %state.topic.fmt_short(),
+                        "initiate catch-up sync session"
+                    );
+                    let config = SessionConfig {
+                        topic: state.topic,
+                        remote: node_id,
+                        live_mode: false,
+                    };
+                    let (actor_ref, _) = SyncSession::<M::Protocol>::spawn_linked(
+                        None,
+                        (state.endpoint.clone(),),
+                        myself.clone().into(),
+                        state.pool.clone(),
+                    )
+                    .await?;
+                    let (session_id, protocol) =
+                        Self::new_session(state, actor_ref.get_id(), node_id, state.topic, config)
+                            .await;
+                    actor_ref.send_message(SyncSessionMessage::Initiate {
+                        node_id,
+                        topic: state.topic,
+                        session_id,
+                        protocol,
+                        protocol_id: state.protocol_id.clone(),
+                    })?;
+                }
+            }
             ToTopicManager::Accept {
                 node_id,
                 connection,
@@ -286,6 +344,7 @@ where
                     %live_mode,
                     "accept sync session"
                 );
+                state.live |= live_mode;
 
                 let config = SessionConfig {
                     topic,
