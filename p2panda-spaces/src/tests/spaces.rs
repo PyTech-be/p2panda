@@ -2511,3 +2511,34 @@ async fn reject_space_update_from_peer() {
     let result = alice.manager.process(&message).await;
     assert!(matches!(result, Err(ManagerError::UnsupportedMessage(_))));
 }
+
+/// A membership change that cannot be encrypted (the new member's key bundle is unknown)
+/// must sign and persist nothing. Otherwise the author's log gains an operation that was
+/// never published, and every later operation is stuck behind the gap.
+///
+/// No dedicated check is needed for this: `Space::add` runs in one write transaction and
+/// dropping it rolls the forged operation back. This test keeps the property guarded.
+#[tokio::test]
+async fn add_without_key_bundle_signs_nothing() {
+    let alice = TestPeer::new(0).await;
+    let bob = TestPeer::new(1).await;
+
+    let space_id = SpaceId::digest(b"0");
+    let (space, output) = alice.manager.create_space(space_id, &[]).await.unwrap();
+    let (messages, _) = split_messages(output.messages);
+    let last_seq = messages.last().unwrap().header.seq_num;
+
+    // Alice does not know Bob's key bundle yet, so the add is refused.
+    assert!(space.add(bob.manager.id(), Access::read()).await.is_err());
+    assert_eq!(space.members().await.unwrap().len(), 1);
+
+    // Once the bundle is known the next add follows the last signed operation directly.
+    alice
+        .manager
+        .register_member(&bob.manager.me().await.unwrap())
+        .await
+        .unwrap();
+    let (auth_message, _, _) =
+        split_space_output(space.add(bob.manager.id(), Access::read()).await.unwrap());
+    assert_eq!(auth_message.header.seq_num, last_seq + 1);
+}
