@@ -46,6 +46,15 @@ impl Credentials {
         Self(Arc::new(inner))
     }
 
+    /// Builds credentials from keys the application already holds, for example an identity
+    /// restored from a backup.
+    pub fn from_keys(signing_key: SigningKey, identity_secret_key: SecretKey) -> Self {
+        Self(Arc::new(Inner {
+            signing_key,
+            identity_secret_key,
+        }))
+    }
+
     pub fn verifying_key(&self) -> VerifyingKey {
         self.0.signing_key.verifying_key()
     }
@@ -88,5 +97,26 @@ impl From<&Credentials> for p2panda_spaces::Credentials {
             credentials.0.signing_key.clone(),
             credentials.0.identity_secret_key.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use p2panda_core::SigningKey;
+
+    use super::{Credentials, SECRET_KEY_SIZE, SecretKey};
+
+    #[test]
+    fn from_keys_keeps_both_keys() {
+        let signing_key = SigningKey::from([7u8; 32]);
+        let secret = SecretKey::from_bytes([9u8; SECRET_KEY_SIZE]);
+
+        let credentials = Credentials::from_keys(signing_key.clone(), secret.clone());
+
+        assert_eq!(credentials.verifying_key(), signing_key.verifying_key());
+        assert_eq!(
+            credentials.identity_key().unwrap(),
+            secret.verifying_key().unwrap()
+        );
     }
 }
