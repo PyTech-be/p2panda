@@ -94,6 +94,14 @@ impl From<Member> for ActorId {
     }
 }
 
+impl From<p2panda_spaces::member::AuthenticatedMember> for Member {
+    /// Wraps a key bundle received outside of p2panda, for example inside an application message.
+    /// Call [`Member::verify`] before trusting it.
+    fn from(inner: p2panda_spaces::member::AuthenticatedMember) -> Self {
+        Self { inner }
+    }
+}
+
 impl From<Member> for p2panda_spaces::member::AuthenticatedMember {
     fn from(value: Member) -> p2panda_spaces::member::AuthenticatedMember {
         value.inner
@@ -403,7 +411,7 @@ mod tests {
     use crate::forge::OperationForge;
     use crate::spaces::forge::member_log_id;
 
-    use super::KeyBundleTask;
+    use super::{KeyBundleTask, Member};
 
     async fn get_op_count(store: &SqliteStore, verifying_key: VerifyingKey) -> u32 {
         let result = store
@@ -444,6 +452,35 @@ mod tests {
         let key_bundle = spaces_manager.me().await.unwrap();
         assert!(key_bundle.verify().is_ok());
         assert_eq!(get_op_count(&store, credentials.verifying_key()).await, 1);
+    }
+
+    #[tokio::test]
+    async fn member_from_authenticated_member() {
+        setup_logging();
+
+        let credentials = Credentials::generate();
+        let store = SqliteStore::temporary().await;
+        let egress = Egress::new();
+
+        let spaces_manager = {
+            let forge = OperationForge::new(credentials.clone(), store.clone());
+            crate::spaces::spaces_manager(
+                forge,
+                credentials.clone(),
+                store.clone(),
+                Config::default(),
+            )
+            .unwrap()
+        };
+        let _task = KeyBundleTask::spawn(spaces_manager.clone(), egress.handle()).await;
+
+        // A key bundle as an application would receive it, for example inside its own message.
+        let key_bundle = spaces_manager.me().await.unwrap();
+        let expected_id = key_bundle.id();
+
+        let member = Member::from(key_bundle);
+        assert!(member.verify().is_ok());
+        assert_eq!(member.id(), expected_id);
     }
 
     #[tokio::test]
