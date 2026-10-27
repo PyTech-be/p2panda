@@ -2470,3 +2470,44 @@ async fn removed_space_members() {
     );
     assert_eq!(space.removed().await.unwrap(), vec![bob.manager.id()]);
 }
+
+/// A `SpaceUpdate` is not supported yet, but any peer can still publish one on a topic we
+/// follow. Processing it must return an error instead of panicking, otherwise one forged
+/// operation crashes every node that receives it.
+#[tokio::test]
+async fn reject_space_update_from_peer() {
+    use crate::forge::Forge;
+    use crate::test_utils::TestForge;
+
+    let alice = TestPeer::new(0).await;
+    let bob = TestPeer::new(1).await;
+
+    alice
+        .manager
+        .register_member(&bob.manager.me().await.unwrap())
+        .await
+        .unwrap();
+
+    let space_id = SpaceId::digest(b"0");
+    alice
+        .manager
+        .create_space(space_id, &[(bob.manager.id(), Access::write())])
+        .await
+        .unwrap();
+
+    // Bob forges a space update with an empty dependency list.
+    let forge = TestForge::new(bob.store.clone(), bob.credentials.signing_key());
+    let message = p2panda_store::tx_unwrap!(bob.store, {
+        forge
+            .forge(SpacesArgs::SpaceUpdate {
+                space_id,
+                group_id: alice.manager.id(),
+                space_dependencies: vec![],
+            })
+            .await
+    })
+    .unwrap();
+
+    let result = alice.manager.process(&message).await;
+    assert!(matches!(result, Err(ManagerError::UnsupportedMessage(_))));
+}
